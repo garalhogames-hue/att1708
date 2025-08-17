@@ -1,94 +1,68 @@
-// /app/api/radio/status/route.ts
-import type { NextRequest } from "next/server";
+export default async function handler(req, res) {
+  const BASE = 'http://sonicpanel.oficialserver.com:8342';
 
-const BASE = "http://sonicpanel.oficialserver.com:8342";
-const STREAM_URL = `${BASE}/;`;
-const CANDIDATES = [
-  `${BASE}/index.html?sid=1`,
-  `${BASE}/index.html`,
-  `${BASE}/`,
-];
+  // helper pra consertar "VocÃª" -> "Você"
+  const fixAcentos = (s) => {
+    try { return decodeURIComponent(escape(s)); } catch { return s; }
+  };
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114 Safari/537.36";
-
-function abs(base: string, url: string) {
+  // lê 7.html
+  let seven;
   try {
-    return new URL(url, base).toString();
-  } catch {
-    return url;
-  }
-}
+    const r = await fetch(`${BASE}/7.html`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    let raw = await r.text();
+    // remove tags HTML que alguns servidores colocam
+    raw = raw.replace(/<[^>]*>/g, '').trim();
 
-function decodeHtml(s: string) {
-  return s
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
-}
+    // pega a linha CSV (v1)
+    const line = raw.split(/\r?\n/).find(l => l.split(',').length >= 7) || raw;
+    const parts = line.split(',');
 
-function textify(html: string) {
-  const cleaned = html
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|tr|li|td|th|h\d)>/gi, "\n")
-    .replace(/<[^>]+>/g, "");
-  return decodeHtml(cleaned)
-    .replace(/\u00a0/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{2,}/g, "\n")
-    .trim();
-}
-
-function getLabelFromHtml(html: string, labelRegex: string) {
-  // Padrão tabela
-  let re = new RegExp(
-    `<td[^>]*>\\s*${labelRegex}\\s*:\\s*<\\/td>\\s*<td[^>]*>([\\s\\S]*?)<\\/td>`,
-    "i"
-  );
-  let m = html.match(re);
-  if (m) return decodeHtml(m[1].replace(/<[^>]+>/g, "").trim());
-
-  // Padrão inline (Label: valor<br>)
-  re = new RegExp(
-    `${labelRegex}\\s*:\\s*([\\s\\S]*?)(?:<br[^>]*\\/?\\s*>|<\\/td>|<\\/tr>|<\\/p>|<hr|\\n)`,
-    "i"
-  );
-  m = html.match(re);
-  if (m) return decodeHtml(m[1].replace(/<[^>]+>/g, "").trim());
-
-  return null;
-}
-
-function getLabelFromText(text: string, label: string) {
-  const re = new RegExp(`^\\s*${label}\\s*:\\s*(.+)$`, "i");
-  for (const line of text.split("\n")) {
-    const m = line.match(re);
-    if (m) return m[1].trim();
-  }
-  return null;
-}
-
-function extractListeners(html: string, text: string, statusText: string | null) {
-  let current: number | null = null;
-  let max: number | null = null;
-
-  // 1) do status "with X of Y listeners"
-  if (statusText) {
-    const m =
-      statusText.match(/with\s+(\d+)\s+of\s+(\d+)\s+listeners/i) ||
-      statusText.match(/com\s+(\d+)\s+de\s+(\d+)\s+ouvintes/i);
-    if (m) {
-      current = parseInt(m[1], 10);
-      max = parseInt(m[2], 10);
-    }
+    const [cur, status, peak, max, unique, br, ...titleParts] = parts;
+    seven = {
+      currentlisteners: Number(cur),
+      streamstatus: Number(status),
+      peaklisteners: Number(peak),
+      maxlisteners: Number(max),
+      uniquelisteners: Number(unique),
+      bitrate: Number(br),
+      songtitle: fixAcentos(titleParts.join(',').trim())
+    };
+  } catch (e) {
+    res.status(502).json({ error: 'Falha ao ler 7.html', details: String(e) });
+    return;
   }
 
-  // 2) campos específicos em HTML
-  if (current == null) {
-    const m =
-      html.match(/Current\s*Listeners[^:]*:\s*<\/td>\s*<td[^>]*>\s*(\d+)/i) ||
-      html.match(/Ouvintes\s*Atuais[^:]*:\s*<\/*
+  // (Opcional) Raspa a página de status pra pegar "Stream Title" e "Stream Genre"
+  let streamTitle = null, streamGenre = null;
+  try {
+    const r = await fetch(`${BASE}/`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const html = await r.text();
+    const findCell = (label) => {
+      const re = new RegExp(`${label}\\s*:?\\s*</?[^>]*>\\s*([^<]+)`, 'i');
+      const m = html.replace(/\n/g, ' ').match(re);
+      return m ? m[1].trim() : null;
+    };
+    streamTitle = findCell('Stream Title') || findCell('Server Title');
+    streamGenre  = findCell('Stream Genre')  || findCell('Server Genre');
+    if (streamTitle) streamTitle = fixAcentos(streamTitle);
+    if (streamGenre) streamGenre = fixAcentos(streamGenre);
+  } catch (_) { /* ok se falhar */ }
+
+  // “Nome do locutor”: em v1 geralmente vem no Stream Title quando há DJ
+  const nomeLocutor = streamTitle || null;
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    online: seven.streamstatus === 1,
+    ouvintes: seven.currentlisteners,
+    maxOuvintes: seven.maxlisteners || null,
+    pico: seven.peaklisteners || null,
+    unicos: seven.uniquelisteners || null,
+    bitrate: seven.bitrate || null,
+    musica: seven.songtitle || null,
+    programacao: streamGenre || null,
+    nomeLocutor,
+    fonte: 'v1-7.html'
+  });
+}
