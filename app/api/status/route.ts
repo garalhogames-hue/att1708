@@ -1,115 +1,213 @@
-// /app/api/radio/status/route.ts  (ou onde você já usa esse endpoint)
+// /app/api/radio/status/route.ts
 import type { NextRequest } from "next/server";
 
-const STATUS_URL = "http://sonicpanel.oficialserver.com:8342/"; // página de status do Shoutcast
-const STREAM_URL = "http://sonicpanel.oficialserver.com:8342/;"; // url do stream para o <audio>
+const BASE = "http://sonicpanel.oficialserver.com:8342";
+const STREAM_URL = `${BASE}/;`; // para o <audio>
 
-function stripHtml(html: string) {
-  return html
-    // quebra linhas para <br> e <p> pra facilitar “varrer” o texto
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<[^>]+>/g, "") // remove tags
-    .replace(/\u00a0/g, " ") // nbsp
-    .replace(/[ \t]+/g, " ") // espaços repetidos
-    .replace(/\n{2,}/g, "\n") // quebras repetidas
-    .trim();
+// tenta várias rotas conhecidas do Shoutcast v1/v2
+const CANDIDATES = [
+  `${BASE}/index.html?sid=1`,
+  `${BASE}/index.html`,
+  `${BASE}/`,
+  `${BASE}/stats?sid=1`,       // v2 (XML)
+  `${BASE}/stats`,             // v2 (XML)
+  `${BASE}/7.html`,            // v1 (csv)
+];
+
+async function tryFetch(url: string) {
+  const r = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 ShoutcastStatusFetcher" },
+    cache: "no-store",
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status} em ${url}`);
+  const text = await r.text();
+  return { url, text };
 }
 
-function pickLabeled(lines: string[], label: string) {
-  // procura linhas do tipo: "Stream Title: Michael"
-  const idx = lines.findIndex((l) =>
-    l.toLowerCase().startsWith(label.toLowerCase() + ":")
-  );
-  if (idx === -1) return null;
-  return lines[idx].split(":").slice(1).join(":").trim() || null;
-}
+// --------- Parsers ---------
 
-function parseListenersFromStatus(statusText: string | null) {
-  // exemplo de status:
-  // "Stream is up at 128 kbps with 41 of 1000 listeners (1 unique)"
-  if (!statusText) return { current: null as number | null, max: null as number | null };
-  const m = statusText.match(/with\s+(\d+)\s+of\s+(\d+)\s+listeners/i);
-  if (m) {
-    return { current: parseInt(m[1], 10), max: parseInt(m[2], 10) };
+function parseFromHtml(html: string) {
+  // pega célula da tabela: "Label:</td><td>valor"
+  const cell = (label: string) => {
+    const re = new RegExp(
+      `${label}\\s*:\\s*<\\/td>\\s*<td[^>]*>\\s*([^<]+)`,
+      "i"
+    );
+    const m = html.match(re);
+    return m ? m[1].trim() : null;
+  };
+
+  const streamStatus = cell("Stream\\s+Status");
+  const streamTitle  = cell("Stream\\s+Title");
+  const streamGenre  = cell("Stream\\s+Genre");
+  const currentSong  = cell("Current\\s+Song");
+  const contentType  = cell("Content\\s+Type");
+
+  // listeners a partir do status "with X of Y listeners"
+  let current: number | null = null;
+  let max: number | null = null;
+  if (streamStatus) {
+    const m = streamStatus.match(/with\s+(\d+)\s+of\s+(\d+)\s+listeners/i);
+    if (m) {
+      current = parseInt(m[1], 10);
+      max = parseInt(m[2], 10);
+    }
   }
-  return { current: null as number | null, max: null as number | null };
+
+  // fallback: às vezes aparece "Current Listeners:" em outra linha
+  if (current === null) {
+    const m = html.match(/Current\s*Listeners[^:]*:\s*<\/td>\s*<td[^>]*>\s*(\d+)/i);
+    if (m) current = parseInt(m[1], 10);
+  }
+  if (max === null) {
+    const m = html.match(/Maximum\s*Listeners[^:]*:\s*<\/td>\s*<td[^>]*>\s*(\d+)/i);
+    if (m) max = parseInt(m[1], 10);
+  }
+
+  const ok = streamTitle || streamGenre || streamStatus || currentSong;
+  if (!ok) return null;
+
+  return {
+    title: streamTitle,
+    genre: streamGenre,
+    statusText: streamStatus,
+    listeners: { current, max },
+    contentType,
+    currentSong,
+  };
 }
+
+function parseFromXml(xml: string) {
+  // Shoutcast v2 XML: <STREAMTITLE>, <GENRE>, <CURRENTLISTENERS>, <MAXLISTENERS>, <SONGTITLE>
+  const tag = (t: string) => {
+    const m = xml.match(new RegExp(`<${t}>([^<]*)</${t}>`, "i"));
+    return m ? m[1].trim() : null;
+  };
+  const title = tag("STREAMTITLE") || tag("SERVERTITLE");
+  const genre = tag("GENRE");
+  const current = tag("CURRENTLISTENERS");
+  const max = tag("MAXLISTENERS");
+  const song = tag("SONGTITLE") || tag("CURRENTSONG");
+
+  // às vezes aparece um status inteiro: <STREAMSTATUS>1</STREAMSTATUS> e <BITRATE>...</BITRATE>
+  const statusRaw = tag("STREAMSTATUS");
+  const bitrate = tag("BITRATE");
+  const statusText =
+    statusRaw && bitrate
+      ? `Stream is ${statusRaw === "1" ? "up" : "down"} at ${bitrate} kbps`
+      : null;
+
+  const ok = title || genre || current || max || song;
+  if (!ok) return null;
+
+  return {
+    title,
+    genre,
+    statusText,
+    listeners: {
+      current: current ? parseInt(current, 10) : null,
+      max: max ? parseInt(max, 10) : null,
+    },
+    contentType: null,
+    currentSong: song,
+  };
+}
+
+function parseFromCsv(csv: string) {
+  // /7.html (v1) retorna algo como: "OK2, listeners, max, ?, bitrate, current song"
+  // ou "OK,xx,yy,zz,bitrate,song"
+  if (!/^OK/i.test(csv)) return null;
+  // limpa tags se vier embrulhado em <html>
+  const text = csv.replace(/<[^>]+>/g, "").trim();
+  const parts = text.split(",").map((s) => s.trim());
+  if (parts.length < 6) return null;
+  const current = parseInt(parts[1], 10);
+  const max = parseInt(parts[2], 10);
+  const song = parts.slice(5).join(", "); // pois o título pode ter vírgulas
+  return {
+    title: null,
+    genre: null,
+    statusText: `with ${isNaN(current) ? "0" : current} of ${isNaN(max) ? "?" : max} listeners`,
+    listeners: {
+      current: isNaN(current) ? null : current,
+      max: isNaN(max) ? null : max,
+    },
+    contentType: null,
+    currentSong: song || null,
+  };
+}
+
+// --------- Handler ---------
 
 export async function GET(_req: NextRequest) {
-  try {
-    const res = await fetch(STATUS_URL, {
-      // user-agent ajuda alguns painéis a devolver o HTML “completo”
-      headers: { "User-Agent": "Mozilla/5.0 (StatusFetcher)" },
-      cache: "no-store",
-    });
+  let lastErr: any = null;
+  for (const url of CANDIDATES) {
+    try {
+      const { text } = await tryFetch(url);
 
-    if (!res.ok) {
-      return new Response(
-        JSON.stringify({ ok: false, error: `Status HTTP ${res.status}` }),
-        {
-          status: 502,
-          headers: {
-            "content-type": "application/json; charset=utf-8",
-            "access-control-allow-origin": "*",
-          },
-        }
-      );
+      // 1) Tenta XML (stats)
+      if (/<SHOUTCASTSERVER>|<STREAMTITLE>|<CURRENTLISTENERS>/i.test(text)) {
+        const parsed = parseFromXml(text);
+        if (parsed) return respond(url, parsed);
+      }
+
+      // 2) Tenta HTML “tabelado” do painel
+      if (/Current\s*Stream\s*Information/i.test(text) || /Stream\s*Status/i.test(text)) {
+        const parsed = parseFromHtml(text);
+        if (parsed) return respond(url, parsed);
+      }
+
+      // 3) Tenta CSV do /7.html
+      if (/^OK/i.test(text) || /OK,/.test(text)) {
+        const parsed = parseFromCsv(text);
+        if (parsed) return respond(url, parsed);
+      }
+    } catch (e: any) {
+      lastErr = e;
+      // tenta o próximo endpoint
     }
+  }
 
-    const html = await res.text();
-    const text = stripHtml(html);
-    const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-
-    const serverStatus = pickLabeled(lines, "Server Status"); // opcional
-    const streamStatus = pickLabeled(lines, "Stream Status");
-    const streamTitle = pickLabeled(lines, "Stream Title");   // locutor / AutoDJ
-    const streamGenre = pickLabeled(lines, "Stream Genre");   // programação
-    const contentType = pickLabeled(lines, "Content Type") ?? null;
-    const currentSong = pickLabeled(lines, "Current Song") ?? null;
-
-    const listeners = parseListenersFromStatus(streamStatus);
-
-    const payload = {
-      ok: true,
-      source: STATUS_URL,
-      serverStatus,
-      stream: {
-        title: streamTitle,     // NOME DO LOCUTOR (ou AutoDJ)
-        genre: streamGenre,     // PROGRAMAÇÃO
-        statusText: streamStatus,
-        listeners,              // { current, max } — mostra mesmo no AutoDJ
-        contentType,
-        currentSong,
-        url: STREAM_URL,
-      },
-      // útil para front-ends
-      display: {
-        locutor: streamTitle,
-        programacao: streamGenre,
-        ouvintes: listeners.current,
-        capacidade: listeners.max,
-      },
-    };
-
-    return new Response(JSON.stringify(payload), {
-      status: 200,
+  // se chegou aqui, nada funcionou
+  return new Response(
+    JSON.stringify({
+      ok: false,
+      error:
+        "Não consegui extrair as informações do Shoutcast (nenhum endpoint conhecidamente suportado retornou dados parseáveis).",
+      detail: lastErr?.message ?? null,
+      tried: CANDIDATES,
+    }),
+    {
+      status: 502,
       headers: {
         "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store",
         "access-control-allow-origin": "*",
       },
-    });
-  } catch (err: any) {
-    return new Response(
-      JSON.stringify({ ok: false, error: err?.message ?? "Erro desconhecido" }),
-      {
-        status: 500,
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "access-control-allow-origin": "*",
-        },
-      }
-    );
-  }
+    }
+  );
+}
+
+function respond(sourceUrl: string, parsed: any) {
+  const payload = {
+    ok: true,
+    source: sourceUrl,
+    stream: {
+      ...parsed,
+      url: STREAM_URL,
+    },
+    display: {
+      locutor: parsed.title,
+      programacao: parsed.genre,
+      ouvintes: parsed.listeners?.current ?? null,
+      capacidade: parsed.listeners?.max ?? null,
+    },
+  };
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+    },
+  });
 }
